@@ -4,16 +4,17 @@ import java.time.temporal.ChronoUnit
 import java.time.{LocalDate, LocalDateTime}
 import scala.io.Source
 import scala.util.{Failure, Success, Try}
+import java.sql.{Connection, DriverManager, PreparedStatement}
 
 object RuleEngine extends App {
 
-  // Identify log levels
-  sealed trait LogLevel
+  // The three possible log levels we can use when writing to the log file
+  trait LogLevel
   case object INFO  extends LogLevel
   case object WARN  extends LogLevel
   case object ERROR extends LogLevel
 
-  // Create data model for transaction before and after processing
+  // Represents one raw transaction exactly as it comes from the CSV
   case class Transaction(
      timestamp: LocalDateTime,
      productName: String,
@@ -24,6 +25,7 @@ object RuleEngine extends App {
      paymentMethod: String
      )
 
+  // Represents transaction with calculated columns
   case class ProcessedTransaction(
     transaction: Transaction,
     finalDiscount: Double,
@@ -33,13 +35,14 @@ object RuleEngine extends App {
   // logger object to use it when I want
   object Logger {
 
-    // format the date and time
-    val formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss")
+    // Defines the format of timestamp in each log line
+    val formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd' 'HH:mm:ss")
 
-    // function that write logs in file
     def log(level: LogLevel, message: String): Unit = {
+      // Capture the current moment and build the full log line
       val timestamp = LocalDateTime.now().format(formatter)
       val line = s"$timestamp  $level  $message"
+      // Try to write to the file, and if it fails print the error to terminal
       Try {
         val writer = new FileWriter("src/main/scala/Retail-Store-Rule-Engine/rules_engine.log", true)
         writer.write(line + "\n")
@@ -53,13 +56,16 @@ object RuleEngine extends App {
 
   // Parse columns in CSV to handle those data types
   def parseLine(line: String): Either[String, Transaction] = {
+    // Split the line into columns, -1 keeps empty fields instead of dropping them
     val cols = line.split(",", -1)
 
     if (cols.length != 7)
       return Left(s"Expected 7 columns but got ${cols.length} in row: $line")
 
+    // Give each column a meaningful name instead of using indexes
     val Array(tsStr, productName, expStr, qtyStr, priceStr, channel, paymentMethod) = cols
 
+    // Try to convert each column to its correct type
     val tsResult = Try(LocalDateTime.parse(tsStr.trim, DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss'Z'")))
       .toEither.left.map(e => s"Bad timestamp '$tsStr': ${e.getMessage}")
     val expResult = Try(LocalDate.parse(expStr.trim, DateTimeFormatter.ofPattern("yyyy-MM-dd")))
@@ -69,6 +75,7 @@ object RuleEngine extends App {
     val priceResult = Try(priceStr.trim.toDouble)
       .toEither.left.map(e => s"Bad price '$priceStr': ${e.getMessage}")
 
+    // If all 4 conversions succeed build the Transaction
     for {
       ts <- tsResult
       exp <- expResult
@@ -90,12 +97,14 @@ object RuleEngine extends App {
         val lines = source.getLines().toList
         source.close()
 
+        // Drop the header row and any blank lines
         val dataLines = lines.filter(line =>
           line.trim.nonEmpty && !line.startsWith("timestamp")
         )
 
         Logger.log(INFO, s"Found ${dataLines.length} rows to process")
 
+        // Parse each line and keep only the successful ones
         val transactions = dataLines.flatMap { line =>
           parseLine(line) match {
             case Right(tx) => Some(tx)
@@ -151,7 +160,7 @@ object RuleEngine extends App {
     case _ => 0.10
   }
 
-  // Rules list
+  // All rules in one list so we can apply them all with a single map and filter
   val allRules: List[Rule] = List(
     (isExpiryQualified, expiryDiscount),
     (isCategoryQualified, categoryDiscount),
@@ -161,12 +170,14 @@ object RuleEngine extends App {
 
   // Discount calculator
   def calculateDiscount(tx: Transaction): Double = {
+    // Apply every rule to the transaction, keep only the qualifying ones and get their discount values
     val qualifiedDiscounts = allRules
       .filter(rule => rule._1(tx))
       .map(rule => rule._2(tx))
       .sorted
       .reverse
 
+    // No qualifying rules = 0%, one rule = use it directly, more than one = average the top 2
     qualifiedDiscounts match {
       case Nil => 0.0
       case head :: Nil => head
@@ -177,35 +188,93 @@ object RuleEngine extends App {
   // function that process transaction and return processed table with discount and final price
   def processTransaction(tx: Transaction): ProcessedTransaction = {
     val discount = calculateDiscount(tx)
+    // Multiply quantity by unit price then apply the discount, rounded to 2 decimal places for currency
     val finalPrice = BigDecimal(tx.quantity * tx.unitPrice * (1 - discount))
       .setScale(2, BigDecimal.RoundingMode.HALF_UP)
       .toDouble
 
-    Logger.log(INFO, s"Processed: ${tx.productName} | discount: ${discount * 100}% | final price: $finalPrice")
-
     ProcessedTransaction(tx, discount, finalPrice)
   }
 
-  // ── CSV Writer ──────────────────────────────────────────────────
-  def saveToCSV(records: List[ProcessedTransaction]): Either[String, Unit] = {
-    Logger.log(INFO, "Writing results to results.csv...")
-    Try {
-      val writer = new FileWriter("src/main/scala/Retail-Store-Rule-Engine/results.csv")
-      // Write the header row first
-      writer.write("timestamp,product_name,expiry_date,quantity,unit_price,channel,payment_method,final_discount,final_price\n")
-
-      // Write one row per processed transaction
-      records.foreach { ptx =>
-        val tx = ptx.transaction
-        val row = s"${tx.timestamp},${tx.productName},${tx.expiryDate},${tx.quantity},${tx.unitPrice},${tx.channel},${tx.paymentMethod},${ptx.finalDiscount},${ptx.finalPrice}\n"
-        writer.write(row)
-      }
-
-      writer.close()
-    }.toEither.left.map(e => s"Cannot write results: ${e.getMessage}")
+  // Opens a connection to the SQLite database file
+  def getConnection(): Either[String, Connection] = {
+    Logger.log(INFO, "Connecting to database...")
+    Try(DriverManager.getConnection("jdbc:sqlite:src/main/scala/Retail-Store-Rule-Engine/retail_engine.db"))
+      .toEither
+      .left.map(e => s"Cannot connect to DB: ${e.getMessage}")
   }
 
-  // ── Main Runner ─────────────────────────────────────────────────
+  // Creates the output table only if it doesn't already exist
+  def createTable(conn: Connection): Either[String, Unit] = {
+    Logger.log(INFO, "Creating table if not exists...")
+    Try {
+      val stmt = conn.createStatement()
+      stmt.execute(
+        """CREATE TABLE IF NOT EXISTS processed_transactions (
+          | timestamp      TEXT,
+          | product_name   TEXT,
+          | expiry_date    TEXT,
+          | quantity       INTEGER,
+          | unit_price     REAL,
+          | channel        TEXT,
+          | payment_method TEXT,
+          | final_discount REAL,
+          | final_price    REAL
+          |)""".stripMargin
+      )
+      stmt.close()
+    }.toEither.left.map(e => s"Cannot create table: ${e.getMessage}")
+  }
+
+  def insertTransaction(conn: Connection, ptx: ProcessedTransaction): Either[String, Unit] = {
+    // The ? placeholders are filled safely by PreparedStatement
+    Try {
+      val sql = """INSERT INTO processed_transactions
+                  |(timestamp, product_name, expiry_date, quantity, unit_price,
+                  | channel, payment_method, final_discount, final_price)
+                  |VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""".stripMargin
+
+      // Fill each ? slot by position starting from 1
+      val ps = conn.prepareStatement(sql)
+      ps.setString(1, ptx.transaction.timestamp.toString)
+      ps.setString(2, ptx.transaction.productName)
+      ps.setString(3, ptx.transaction.expiryDate.toString)
+      ps.setInt   (4, ptx.transaction.quantity)
+      ps.setDouble(5, ptx.transaction.unitPrice)
+      ps.setString(6, ptx.transaction.channel)
+      ps.setString(7, ptx.transaction.paymentMethod)
+      ps.setDouble(8, ptx.finalDiscount)
+      ps.setDouble(9, ptx.finalPrice)
+      ps.executeUpdate()
+      ps.close()
+    }.toEither.left.map(e => s"Cannot insert row: ${e.getMessage}")
+  }
+
+  def saveTransactions(records: List[ProcessedTransaction]): Either[String, Unit] = {
+    getConnection() match {
+      case Left(err)   => Left(err)
+      case Right(conn) =>
+        createTable(conn) match {
+          case Left(err) => Left(err)
+          case Right(_)  =>
+            // Insert every record and collect the results as a list of Either
+            val results = records.map(ptx => insertTransaction(conn, ptx))
+            // Extract only the failed inserts to check if anything went wrong
+            val errors  = results.collect { case Left(err) => err }
+            conn.close()
+
+            if (errors.isEmpty) {
+              Logger.log(INFO, s"Successfully saved ${records.length} records to database")
+              Right(())
+            } else {
+              Logger.log(WARN, s"${errors.length} rows failed to insert")
+              Left(errors.mkString("\n"))
+            }
+        }
+    }
+  }
+
+  // Main Runner
   Logger.log(INFO, "=== Rule Engine Started ===")
 
   loadTransactions("src/main/resources/TRX1000.csv") match {
@@ -214,9 +283,11 @@ object RuleEngine extends App {
 
     case Right(transactions) =>
       Logger.log(INFO, s"Processing ${transactions.length} transactions...")
+      // Transform every raw transaction into a processed one
       val processed = transactions.map(tx => processTransaction(tx))
+      Logger.log(INFO, s"All ${processed.length} transactions processed successfully")
 
-      saveToCSV(processed) match {
+      saveTransactions(processed) match {
         case Left(err) =>
           Logger.log(ERROR, s"Failed to save to database: $err")
         case Right(_) =>
