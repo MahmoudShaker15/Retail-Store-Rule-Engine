@@ -181,7 +181,10 @@ object RuleEngine extends App {
     qualifiedDiscounts match {
       case Nil => 0.0
       case head :: Nil => head
-      case top2 => top2.take(2).sum / 2
+      case top2 =>
+        BigDecimal(top2.take(2).sum / 2)
+          .setScale(4, BigDecimal.RoundingMode.HALF_UP)
+          .toDouble
     }
   }
 
