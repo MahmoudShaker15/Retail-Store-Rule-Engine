@@ -11,5 +11,8 @@ The engine reads transactions from a CSV file, evaluates each one against a set 
 - **Functional Style:** pure functions, immutable data, no loops, no vars
 - **Smart Aggregation:** if a transaction qualifies for multiple discounts, the top 2 are averaged
 - **Safe Error Handling:** uses Either and Try instead of exceptions, bad CSV rows - are skipped and logged without stopping the engine
+- **Chunk-Based Streaming:** the CSV is read and processed in chunks of 2 million rows at a time so the full file is never loaded into memory, making it safe to run on files of any size
+- **Parallel Processing:** reducing total runtime on large datasets by parse and process each chunk in parallel across all available CPU cores.
+- **Batch Database Writes:** processed records are inserted into SQLite in a single batched transaction per chunk instead of row by row
 - **Automatic Logging:** every engine event is recorded in rules_engine.log with timestamp and severity level
 - **Database Output:** all processed transactions with their discounts and final prices are saved to retail_engine.db
