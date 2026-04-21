@@ -160,12 +160,27 @@ object RuleEngine extends App {
     case _ => 0.10
   }
 
+  // Rule 5 - App Channel
+  def isAppQualified(tx: Transaction): Boolean = tx.channel.toLowerCase == "app"
+
+  def appDiscount(tx: Transaction): Double = {
+    val roundedUp = math.ceil(tx.quantity / 5.0) * 5
+    (roundedUp / 5) * 0.05
+  }
+
+  // Rule 6 - Visa Card Payment
+  def isVisaQualified(tx: Transaction): Boolean = tx.paymentMethod.toLowerCase == "visa"
+
+  def visaDiscount(tx: Transaction): Double = 0.05
+
   // All rules in one list so we can apply them all with a single map and filter
   val allRules: List[Rule] = List(
     (isExpiryQualified, expiryDiscount),
     (isCategoryQualified, categoryDiscount),
     (isSpecialDayQualified, specialDayDiscount),
-    (isQuantityQualified, quantityDiscount)
+    (isQuantityQualified, quantityDiscount),
+    (isAppQualified, appDiscount),
+    (isVisaQualified, visaDiscount)
   )
 
   // Discount calculator

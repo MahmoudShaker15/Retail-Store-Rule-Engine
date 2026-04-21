@@ -6,7 +6,7 @@ The engine reads transactions from a CSV file, evaluates each one against a set 
 
 ## Key Features
 
-- **4 Discount Rules:** expiry proximity, product category (cheese/wine), special day (March 23rd), and bulk quantity
+- **6 Discount Rules:** expiry proximity, product category (cheese/wine), special day (March 23rd), bulk quantity, app channel, and Visa card payment
 - **Higher Order Functions:** rules are stored as a list of function pairs and applied with map and filter, making it easy to add new rules without changing any other part of the engine
 - **Functional Style:** pure functions, immutable data, no loops, no vars
 - **Smart Aggregation:** if a transaction qualifies for multiple discounts, the top 2 are averaged
