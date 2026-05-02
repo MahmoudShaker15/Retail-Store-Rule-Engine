@@ -98,34 +98,37 @@ object RuleEngine extends App {
         val lines = source.getLines()
           .filterNot(line => line.trim.isEmpty || line.startsWith("timestamp"))
 
-        // Process and save chunk by chunk — never load full file into memory
-        lines
-          .grouped(2500000)                         // take 100k lines at a time
-          .foreach { chunk =>
-            // Parse chunk in parallel
-            val transactions = chunk.par.flatMap { line =>
-              parseLine(line) match {
-                case Right(tx) => Some(tx)
-                case Left(_) => None
-              }
-            }.toList
+        getConnection() match {
+          case Left(err) =>
+            source.close()
+            Logger.log(ERROR, s"Cannot connect to DB: $err")
+            Left(err)
 
-            Logger.log(INFO, s"Parsed ${transactions.size} transactions, processing...")
+          case Right(conn) =>
+            lines.grouped(1000000).foreach { chunk =>
+              val transactions = chunk.par.flatMap { line =>
+                parseLine(line) match {
+                  case Right(tx) => Some(tx)
+                  case Left(_) => None
+                }
+              }.toList
 
-            // Process chunk in parallel
-            val processed = transactions.par
-              .map(tx => processTransaction(tx))
-              .toList
+              Logger.log(INFO, s"Parsed ${transactions.size} transactions, processing...")
 
-            Logger.log(INFO, s"Processed ${processed.size} transactions, saving to DB...")
+              val processed = transactions.par
+                .map(tx => processTransaction(tx))
+                .toList
 
-            // Write this chunk to DB immediately then discard it from memory
-            saveTransactions(processed)
-          }
+              Logger.log(INFO, s"Processed ${processed.size} transactions, saving to DB...")
 
-        source.close()
-        Logger.log(INFO, "All chunks processed and saved successfully")
-        Right(())
+              saveTransactions(processed, conn)
+            }
+
+            conn.close()
+            source.close()
+            Logger.log(INFO, "All chunks processed and saved successfully")
+            Right(())
+        }
     }
   }
 
@@ -253,57 +256,48 @@ object RuleEngine extends App {
     }.toEither.left.map(e => s"Cannot create table: ${e.getMessage}")
   }
 
-  def saveTransactions(records: List[ProcessedTransaction]): Either[String, Unit] = {
-    getConnection() match {
+  def saveTransactions(records: List[ProcessedTransaction], conn: Connection): Either[String, Unit] = {
+    createTable(conn) match {
       case Left(err) => Left(err)
-      case Right(conn) =>
-        createTable(conn) match {
-          case Left(err) => Left(err)
+      case Right(_) =>
+        Try {
+          Logger.log(INFO, "Writing to database...")
+          val sql =
+            """INSERT INTO processed_transactions
+              |(timestamp, product_name, expiry_date, quantity, unit_price,
+              | channel, payment_method, final_discount, final_price)
+              |VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""".stripMargin
+
+          val ps = conn.prepareStatement(sql)
+          conn.setAutoCommit(false)
+
+          records.foreach { ptx =>
+            ps.setString(1, ptx.transaction.timestamp.toString)
+            ps.setString(2, ptx.transaction.productName)
+            ps.setString(3, ptx.transaction.expiryDate.toString)
+            ps.setInt (4, ptx.transaction.quantity)
+            ps.setDouble(5, ptx.transaction.unitPrice)
+            ps.setString(6, ptx.transaction.channel)
+            ps.setString(7, ptx.transaction.paymentMethod)
+            ps.setDouble(8, ptx.finalDiscount)
+            ps.setDouble(9, ptx.finalPrice)
+            ps.addBatch()
+          }
+
+          ps.executeBatch()
+          conn.commit()
+          ps.close()
+
+        }.toEither.left.map { e =>
+          Try(conn.rollback())
+          s"Batch insert failed: ${e.getMessage}"
+        } match {
+          case Left(err) =>
+            Logger.log(WARN, s"Chunk failed to save: $err")
+            Left(err)
           case Right(_) =>
-            Try {
-              Logger.log(INFO, "Writing to database...")
-              val sql =
-                """INSERT INTO processed_transactions
-                  |(timestamp, product_name, expiry_date, quantity, unit_price,
-                  | channel, payment_method, final_discount, final_price)
-                  |VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""".stripMargin
-
-              val ps = conn.prepareStatement(sql)
-
-              // Wrap everything in one transaction — SQLite commits once at the end
-              conn.setAutoCommit(false)
-
-              // Add every record to the batch without executing yet
-              records.foreach { ptx =>
-                ps.setString(1, ptx.transaction.timestamp.toString)
-                ps.setString(2, ptx.transaction.productName)
-                ps.setString(3, ptx.transaction.expiryDate.toString)
-                ps.setInt(4, ptx.transaction.quantity)
-                ps.setDouble(5, ptx.transaction.unitPrice)
-                ps.setString(6, ptx.transaction.channel)
-                ps.setString(7, ptx.transaction.paymentMethod)
-                ps.setDouble(8, ptx.finalDiscount)
-                ps.setDouble(9, ptx.finalPrice)
-                ps.addBatch()
-              }
-
-              ps.executeBatch() // <-- sends ALL rows to DB in one shot
-              conn.commit()     // <-- SQLite writes everything to disk once
-              ps.close()
-
-            }.toEither.left.map { e =>
-              Try(conn.rollback()) // if anything fails, undo the whole chunk
-              s"Batch insert failed: ${e.getMessage}"
-            } match {
-              case Left(err) =>
-                conn.close()
-                Logger.log(WARN, s"Chunk failed to save: $err")
-                Left(err)
-              case Right(_) =>
-                conn.close()
-                Logger.log(INFO, s"Successfully saved ${records.size} records to database")
-                Right(())
-            }
+            Logger.log(INFO, s"Successfully saved ${records.size} records to database")
+            Right(())
         }
     }
   }
