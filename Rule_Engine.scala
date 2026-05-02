@@ -4,15 +4,15 @@ import java.time.temporal.ChronoUnit
 import java.time.{LocalDate, LocalDateTime}
 import scala.io.Source
 import scala.util.{Failure, Success, Try}
-import java.sql.{Connection, DriverManager, PreparedStatement}
+import java.sql.{Connection, DriverManager}
 import scala.collection.parallel.CollectionConverters._
 
 object RuleEngine extends App {
 
   // The three possible log levels we can use when writing to the log file
   trait LogLevel
-  case object INFO  extends LogLevel
-  case object WARN  extends LogLevel
+  case object INFO extends LogLevel
+  case object WARN extends LogLevel
   case object ERROR extends LogLevel
 
   // Represents one raw transaction exactly as it comes from the CSV
@@ -105,7 +105,7 @@ object RuleEngine extends App {
             Left(err)
 
           case Right(conn) =>
-            lines.grouped(1000000).foreach { chunk =>
+            lines.grouped(250000).foreach { chunk =>
               val transactions = chunk.par.flatMap { line =>
                 parseLine(line) match {
                   case Right(tx) => Some(tx)
@@ -241,15 +241,15 @@ object RuleEngine extends App {
       val stmt = conn.createStatement()
       stmt.execute(
         """CREATE TABLE IF NOT EXISTS processed_transactions (
-          | timestamp      TEXT,
-          | product_name   TEXT,
-          | expiry_date    TEXT,
-          | quantity       INTEGER,
-          | unit_price     REAL,
-          | channel        TEXT,
+          | timestamp TEXT,
+          | product_name TEXT,
+          | expiry_date TEXT,
+          | quantity INTEGER,
+          | unit_price REAL,
+          | channel TEXT,
           | payment_method TEXT,
           | final_discount REAL,
-          | final_price    REAL
+          | final_price REAL
           |)""".stripMargin
       )
       stmt.close()
